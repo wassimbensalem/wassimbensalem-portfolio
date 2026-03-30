@@ -1,0 +1,124 @@
+---
+title: "The Agentic AI Engineer: Why Production Experience Changes Everything"
+date: "2026-02-28"
+readingTime: "7 min read"
+excerpt: "Everyone is building AI agents. Very few are building AI agents that work in production. The difference isn't the model — it's the engineer."
+tags: ["Agentic AI", "LangGraph", "Production", "Engineering"]
+---
+
+There is a generation of engineers who learned about Agentic AI from tutorials. They built agents that could search the web, summarize PDFs, and call APIs in a Jupyter notebook. The demos were impressive. The GitHub stars accumulated.
+
+Then they tried to deploy them.
+
+I came to Agentic AI from the opposite direction — from production MLOps, from Kubernetes clusters that had to stay up, from automotive AI systems where a failure has real-world consequences. That background changed how I think about agents entirely.
+
+## What "Production" Actually Means
+
+Production isn't a technical property — it's a contract. When a system is in production, it has made promises to other systems and to humans about its behavior. It will respond within N milliseconds. It will produce outputs in a defined schema. It will fail in ways that allow downstream systems to recover.
+
+An LLM agent, by default, makes none of these promises. It will take as long as the model takes. It will produce whatever the model produces. It will fail with a traceback that tells you nothing about what the agent was trying to do when it failed.
+
+Bridging that gap — from "it works in a demo" to "it works under load, at 3am, when the model API is rate-limiting and the input is malformed" — is the actual engineering problem.
+
+## The Three Production Gaps
+
+### Gap 1: State Management
+
+Tutorial agents are stateless. Each invocation starts fresh. This is fine for a demo where you control the inputs. It's a disaster for production where:
+
+- A user starts a task and comes back 20 minutes later
+- A multi-step workflow gets interrupted by a network failure
+- You need to audit what an agent did and why
+
+Production agents need durable state — checkpointed between steps, recoverable after failure, observable from outside. LangGraph handles this better than raw LangChain precisely because it models the agent as a graph with explicit state transitions, not as a chain of calls.
+
+```python
+from langgraph.graph import StateGraph, END
+from typing import TypedDict
+
+class AgentState(TypedDict):
+    messages: list[dict]
+    current_step: str
+    context: dict
+    error: str | None
+
+# Every node receives and returns full state
+def planning_node(state: AgentState) -> AgentState:
+    # ...
+    return {**state, "current_step": "execution", "context": plan}
+```
+
+The state is the contract. When something goes wrong, you have the full state at the point of failure.
+
+### Gap 2: Reliability Engineering
+
+A production agent needs the same reliability engineering as any other production service:
+
+**Timeouts everywhere.** LLM calls can hang. Your agent framework probably doesn't timeout by default. Set timeouts at the HTTP level, at the step level, and at the overall workflow level.
+
+**Retry with exponential backoff.** Model APIs rate-limit. Tools fail. Your agent should retry transient failures automatically and distinguish them from permanent failures.
+
+**Circuit breakers.** If an external tool fails 5 times in a row, stop calling it and surface a clear error. Don't let your agent loop infinitely trying to call a broken API.
+
+**Dead letter queues.** When an agent workflow fails permanently, the task needs to go somewhere — a queue, a database, a human review system. It should not disappear silently.
+
+### Gap 3: Observability
+
+This is the gap I see most often, and it's the one that makes debugging production agents most painful.
+
+Logging `print(f"Agent step: {step}")` is not observability. Observability means being able to answer, after the fact:
+
+- What was the agent's intent at each step?
+- What tool calls did it make, with what inputs and outputs?
+- Where in the decision tree did it go wrong?
+- What was the latency of each component?
+
+For my current project, ReviveAI, I structured every agent action as a structured log event:
+
+```python
+@dataclass
+class AgentAction:
+    step_id: str
+    step_type: str  # "planning" | "tool_call" | "reflection" | "output"
+    timestamp: datetime
+    input_summary: str
+    output_summary: str
+    tool_name: str | None
+    latency_ms: int
+    error: str | None
+    parent_step_id: str | None
+```
+
+Every action gets persisted. When something goes wrong in production, I have a complete execution trace.
+
+## The Model Is Not the Hard Part
+
+This sounds heretical to people who've been following the LLM benchmarks. But in my experience, the model is almost never the limiting factor in production agentic systems.
+
+The hard parts are:
+- Defining the right task scope (what should the agent do vs. what should a human do)
+- Building reliable tool interfaces (garbage in, garbage out — always)
+- Handling the long tail of failure modes (what happens when the input is weird)
+- Making the system debuggable when it inevitably does something unexpected
+
+GPT-4o and Claude are both more than capable enough for most production agentic tasks. What they can't do is make up for a poorly designed tool interface or recover from a task scope that's too broad.
+
+## What This Means for How You Build
+
+If you're building agentic systems for production:
+
+1. **Design the state schema first.** Before writing any agent logic, define exactly what state your agent needs and what shape failures take. This is your API contract.
+
+2. **Make each step idempotent.** An agent step that can be safely retried is vastly easier to operate than one that can't.
+
+3. **Build observability from day one.** It's much harder to add structured logging to an existing agent than to design for it from the start.
+
+4. **Start with narrow scope.** A production agent that reliably does one thing is worth more than an impressive demo that does ten things unreliably.
+
+5. **Plan for human escalation.** Every agent system should have a defined path for escalating to a human when confidence is low or the task is outside known patterns.
+
+The agents that survive contact with production are built by engineers who've operated production systems. That experience — knowing what can go wrong and how to reason about it — transfers directly.
+
+---
+
+*Wassim Ben Salem is building autonomous AI systems at Compredict GmbH and through his side projects. Follow on [X](https://x.com/wassimbs2) or connect on [LinkedIn](https://linkedin.com/in/wassimbensalem).*

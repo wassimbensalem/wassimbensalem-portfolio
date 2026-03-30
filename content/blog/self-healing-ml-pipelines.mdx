@@ -1,0 +1,110 @@
+---
+title: "Building Self-Healing ML Pipelines: Lessons from Automotive AI at Scale"
+date: "2026-03-15"
+readingTime: "9 min read"
+excerpt: "Production ML pipelines fail in ways your test suite will never catch. Here's what I learned building automotive AI systems that recover themselves."
+tags: ["MLOps", "Kubeflow", "Agentic AI", "Production"]
+---
+
+Production ML is not a solved problem. You can have unit tests, integration tests, and a staging environment that matches production exactly — and your pipeline will still fail in ways you never anticipated. I know this firsthand from building and operating ML pipelines for automotive OEM customers at Compredict, where a failure doesn't just mean a slow API response. It means a Virtual Sensor that was guiding real-time vehicle health decisions has gone silent.
+
+This post is about what I learned building pipelines that don't just fail gracefully — they heal themselves.
+
+## Why ML Pipelines Fail Differently
+
+Traditional software fails at defined boundaries: a network timeout, a null pointer, an unhandled exception. The fix is usually deterministic — you catch the error, log it, retry or fall back.
+
+ML pipelines fail at the intersection of code, data, and model state. The same `train.py` that ran perfectly last Tuesday can fail today because:
+
+- A new OEM dataset has a different sensor sampling rate
+- A model checkpoint was corrupted mid-write during a pod restart
+- A hyperparameter search explored a region that causes gradient explosion
+- GPU memory fragmented after 72 hours of continuous operation
+
+None of these are bugs in the traditional sense. They're emergent failures at the boundary between your system and the real world.
+
+## The Architecture of a Self-Healing Pipeline
+
+At Compredict, our pipelines run on Kubeflow with Ray for distributed training. The self-healing capability emerged from three architectural decisions:
+
+### 1. Deterministic Checkpointing
+
+Every training step writes a checkpoint with enough context to resume from that exact state. Not just model weights — but the data shard it was processing, the RNG seeds, the optimizer state, and the step's input hash.
+
+```python
+@dataclass
+class CheckpointContext:
+    step: int
+    model_state: dict
+    optimizer_state: dict
+    data_shard_id: str
+    data_shard_hash: str
+    rng_state: dict
+    metadata: dict[str, Any]
+```
+
+When a step fails, the pipeline doesn't restart from epoch 0. It loads the last valid checkpoint and picks up exactly where it left off.
+
+### 2. Anomaly Detection as a First-Class Pipeline Stage
+
+Before we had self-healing, we had dashboards. Engineers would watch Grafana panels for loss spikes, gradient norms going to infinity, or validation metrics diverging from training metrics. The dashboards were accurate. The humans watching them were not always available.
+
+We moved anomaly detection into the pipeline itself — a lightweight detector that runs after every N steps:
+
+```python
+class TrainingHealthMonitor:
+    def __init__(self, window_size: int = 50):
+        self.loss_history: deque[float] = deque(maxlen=window_size)
+        self.grad_norm_history: deque[float] = deque(maxlen=window_size)
+
+    def check(self, loss: float, grad_norm: float) -> HealthStatus:
+        self.loss_history.append(loss)
+        self.grad_norm_history.append(grad_norm)
+
+        if len(self.loss_history) < 10:
+            return HealthStatus.OK
+
+        # Detect loss explosion
+        if loss > 10 * np.mean(list(self.loss_history)[:-1]):
+            return HealthStatus.LOSS_EXPLOSION
+
+        # Detect gradient vanishing
+        if grad_norm < 1e-7:
+            return HealthStatus.GRADIENT_VANISHING
+
+        return HealthStatus.OK
+```
+
+When the monitor returns anything other than `OK`, the pipeline pauses, logs a structured event, and triggers a recovery strategy.
+
+### 3. Agentic Recovery Loops
+
+The final piece — and the most recent addition — is an LLM-powered recovery agent. When automated recovery strategies are exhausted (rollback to checkpoint, adjust learning rate, restart with fresh data shard), the agent is invoked.
+
+The agent receives a structured context: the failure type, the last 100 training steps' metrics, the current hyperparameters, and a description of the dataset. It proposes a recovery action — which the pipeline can execute autonomously for low-risk actions (learning rate adjustment, data re-sampling) or escalate to a human via webhook for high-risk actions (architecture changes, dataset exclusion).
+
+This is Agentic AI in production — not a chatbot, not a demo. An agent embedded in an industrial ML system, making decisions with real consequences.
+
+## What Actually Reduced Dev Cycles by 70%
+
+The metric I quote on my CV — 70% reduction in development cycle time — doesn't come primarily from self-healing. It comes from the upstream investment in deterministic pipelines.
+
+When your pipeline is deterministic and checkpointed, you can:
+- Reproduce any failure exactly, every time
+- Test recovery strategies against recorded failure states
+- Parallelize hyperparameter search without shared state conflicts
+- Audit exactly which data contributed to a model version
+
+The self-healing is downstream of that. You can only heal reliably what you can reason about precisely.
+
+## The Limits
+
+Self-healing works for operational failures — corrupted checkpoints, OOM errors, temporary data unavailability. It does not work for fundamental failures: a model architecture that's wrong for the task, training data with systematic label errors, a feature distribution shift that invalidates your entire validation set.
+
+For those, you need humans. The pipeline should make it easy for humans to diagnose and intervene — not pretend the problem doesn't exist.
+
+The best production ML system is one that handles the boring failures automatically and surfaces the interesting failures clearly.
+
+---
+
+*Wassim Ben Salem is an MLOps Engineer at Compredict GmbH and builds autonomous AI systems. Follow him on [X](https://x.com/wassimbs2) or [LinkedIn](https://linkedin.com/in/wassimbensalem).*

@@ -1,0 +1,116 @@
+---
+title: "91% Smaller, Just as Smart: Compressing Neural Networks for Edge Deployment"
+date: "2026-01-20"
+readingTime: "10 min read"
+excerpt: "My master's thesis achieved 91% model size reduction while outperforming state-of-the-art benchmarks. Here's the approach that made it work."
+tags: ["ML Research", "Model Compression", "Automotive AI", "Neural Architecture Search"]
+---
+
+The constraint that drives the most interesting engineering is resource scarcity. When you have unlimited compute, you can throw a bigger model at the problem. When you're deploying to an automotive ECU with 512MB of RAM and a hard real-time constraint of 5ms per inference, you have to be clever.
+
+My master's thesis at TU Darmstadt was about making time-series neural networks small enough to run on automotive edge hardware without sacrificing accuracy. We achieved a 91% reduction in model size while outperforming state-of-the-art baselines. This is the story of how.
+
+## The Problem: Time-Series at the Edge
+
+Modern vehicles generate enormous amounts of sensor data — acceleration, wheel speed, torque, temperature, pressure — at high frequency, continuously. The use case I was working on was Virtual Sensors: ML models that infer values that aren't directly measured (like tire wear or brake pad condition) from values that are.
+
+These models need to:
+- Run in real-time on embedded hardware
+- Maintain accuracy over the model's lifetime as the vehicle ages
+- Be updatable over-the-air without requiring a hardware replacement
+
+The last constraint is the interesting one. An OTA update that ships a 200MB model is impractical. An update that ships a 15MB model with equivalent accuracy is deployable.
+
+## The Three-Stage Compression Pipeline
+
+The approach combined three techniques that I found worked synergistically:
+
+### Stage 1: Wasserstein GAN Knowledge Distillation
+
+Knowledge distillation is the classic compression approach: you train a small "student" network to mimic a large "teacher" network. The standard approach trains the student to match the teacher's output probabilities.
+
+For time-series regression tasks, output matching alone loses too much information. The student needs to learn the teacher's internal representations — how the teacher models temporal dependencies, not just what it predicts.
+
+I used a Wasserstein GAN formulation for the distillation loss. The student generates feature distributions; a discriminator tries to distinguish student features from teacher features. The adversarial training forces the student to learn distributions that are indistinguishable from the teacher's, not just outputs that are numerically close.
+
+```python
+def wgan_distillation_loss(
+    teacher_features: torch.Tensor,
+    student_features: torch.Tensor,
+    discriminator: nn.Module,
+    lambda_gp: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Wasserstein distance between feature distributions
+    real_score = discriminator(teacher_features).mean()
+    fake_score = discriminator(student_features.detach()).mean()
+    w_distance = real_score - fake_score
+
+    # Gradient penalty for Lipschitz constraint
+    alpha = torch.rand(teacher_features.size(0), 1, 1, device=teacher_features.device)
+    interpolated = alpha * teacher_features + (1 - alpha) * student_features.detach()
+    interpolated.requires_grad_(True)
+    interp_score = discriminator(interpolated).mean()
+    gradients = torch.autograd.grad(
+        outputs=interp_score,
+        inputs=interpolated,
+        create_graph=True,
+    )[0]
+    gp = lambda_gp * ((gradients.norm(2, dim=-1) - 1) ** 2).mean()
+
+    d_loss = -w_distance + gp
+    g_loss = -discriminator(student_features).mean()
+
+    return d_loss, g_loss
+```
+
+### Stage 2: Neural Architecture Search for the Student
+
+The student architecture isn't hand-designed — it's searched. I used Katib (Kubernetes-native NAS) to explore the architecture space: number of layers, hidden dimensions, attention heads, convolutional kernel sizes.
+
+The key insight was constraining the search to architectures that fit within the target memory budget first, then optimizing for accuracy within that constraint. Searching for "accurate first, small second" reliably produces models that are accurate at teacher-scale but only marginally smaller.
+
+The Pareto frontier of accuracy vs. model size was the actual objective:
+
+```python
+@dataclass
+class ArchitectureSearchConfig:
+    max_params: int = 500_000        # Hard constraint: 500K parameters max
+    min_accuracy_threshold: float = 0.92  # Must beat baseline
+    search_iterations: int = 200
+
+    # Architecture search space
+    num_layers: tuple[int, int] = (2, 6)
+    hidden_dim: tuple[int, int] = (32, 256)
+    kernel_sizes: list[int] = field(default_factory=lambda: [3, 5, 7, 11])
+    use_attention: list[bool] = field(default_factory=lambda: [True, False])
+```
+
+### Stage 3: Iterative Magnitude Pruning
+
+After distillation, the student network still had weights that contributed little to output accuracy. Post-training pruning removed these, with an iterative approach: prune 20% of the smallest-magnitude weights, fine-tune for 5 epochs, repeat.
+
+The critical insight here is the fine-tuning between pruning rounds. Pruning all at once (structured or unstructured) loses too much information. The gradual approach allows the remaining weights to compensate for what was removed.
+
+## The Results
+
+The final model was 91% smaller than the teacher and achieved better accuracy on the test set — not just comparable. This is the counterintuitive result that motivated the thesis.
+
+The explanation: the teacher model was over-parameterized for the task. Its large parameter count allowed it to learn representations that were accurate but redundant. The compression process forced the student to learn more efficient representations that generalized better.
+
+This pattern — that constrained models sometimes outperform unconstrained ones on specific tasks — is well-documented in the literature but often underappreciated in practice. The constraint is the feature, not the bug.
+
+## What This Taught Me About ML Engineering
+
+Three things I carried from this work into production ML:
+
+**1. Start with the deployment constraint.** The target hardware and its constraints should define the model architecture search space, not the other way around. "We'll optimize for deployment later" is how you end up with a great research model that can't be shipped.
+
+**2. Adversarial training for representation matching is underused.** The WGAN distillation approach worked better than cross-entropy or MSE matching for distributional alignment. This generalizes: when you need two networks to produce similar internal representations, adversarial training is worth trying.
+
+**3. Iterative compression beats aggressive one-shot compression.** Whether you're pruning, quantizing, or distilling, doing it gradually with fine-tuning between rounds consistently outperforms doing it all at once. The extra compute cost is worth it.
+
+The automotive edge deployment constraint was the forcing function for all three of these insights. I've found that real constraints — not hypothetical ones, but actual hardware you have to run on — are the best teacher in ML engineering.
+
+---
+
+*Wassim Ben Salem is an MLOps Engineer specializing in production AI systems. His thesis work on neural compression for automotive edge deployment was graded 1.0 at TU Darmstadt. [LinkedIn](https://linkedin.com/in/wassimbensalem) · [X](https://x.com/wassimbs2)*
