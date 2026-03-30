@@ -24,21 +24,26 @@ export function getAllPosts(): PostMeta[] {
 
   return files
     .map((filename) => {
-      const slug = filename.replace(/\.mdx$/, '')
-      const fullPath = path.join(BLOG_DIR, filename)
-      const fileContents = fs.readFileSync(fullPath, 'utf8')
-      const { data } = matter(fileContents)
+      try {
+        const slug = filename.replace(/\.mdx$/, '')
+        const fullPath = path.join(BLOG_DIR, filename)
+        const fileContents = fs.readFileSync(fullPath, 'utf8')
+        const { data } = matter(fileContents)
 
-      return {
-        slug,
-        title: data.title as string,
-        date: data.date as string,
-        readingTime: data.readingTime as string,
-        excerpt: data.excerpt as string,
-        tags: (data.tags as string[]) ?? [],
+        return {
+          slug,
+          title: data.title as string,
+          date: data.date as string,
+          readingTime: data.readingTime as string,
+          excerpt: data.excerpt as string,
+          tags: (data.tags as string[]) ?? [],
+        }
+      } catch {
+        return null
       }
     })
-    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .filter((post): post is PostMeta => post !== null)
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
 }
 
 export function getPostBySlug(slug: string): Post | null {

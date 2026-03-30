@@ -15,7 +15,8 @@ export function buildMetadata({
   type = 'website',
   publishedAt,
 }: PageMetaInput): Metadata {
-  const url = `https://wassimbensalem.com${path}`
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://wassimbensalem.com'
+  const url = `${siteUrl}${path}`
 
   return {
     title: `${title} — Wassim Ben Salem`,
