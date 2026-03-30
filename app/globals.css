@@ -13,6 +13,21 @@
   --color-accent: oklch(0.65 0.2 220);
   --color-accent-glow: oklch(0.65 0.2 220 / 0.15);
 
+  /* shadcn/ui compatibility tokens — mapped to our design system */
+  --color-primary: var(--color-foreground);
+  --color-primary-foreground: var(--color-background);
+  --color-secondary: var(--color-card);
+  --color-secondary-foreground: var(--color-foreground);
+  --color-destructive: oklch(0.65 0.2 25);
+  --color-destructive-foreground: var(--color-foreground);
+  --color-ring: var(--color-accent);
+  --color-input: var(--color-border);
+  --color-muted-foreground: var(--color-muted);
+  --color-card-foreground: var(--color-foreground);
+  --color-popover: var(--color-card);
+  --color-popover-foreground: var(--color-foreground);
+  --color-accent-foreground: var(--color-foreground);
+
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, "Cascadia Code", monospace;
 
