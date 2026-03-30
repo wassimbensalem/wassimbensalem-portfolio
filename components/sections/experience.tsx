@@ -1,6 +1,5 @@
 import { FadeUp, StaggerContainer, StaggerItem } from '@/components/motion-wrapper'
 import { Download } from 'lucide-react'
-import { buttonVariants } from '@/components/ui/button'
 
 interface ExperienceEntry {
   title: string
@@ -101,7 +100,7 @@ export function Experience() {
           <a
             href="/wassim-ben-salem-cv.pdf"
             download
-            className={buttonVariants({ variant: 'ghost', size: 'default' }) + ' gap-2'}
+            className="inline-flex items-center gap-2 font-mono text-xs border border-[--color-border] text-[--color-muted] hover:text-[--color-foreground] hover:border-[--color-muted] bg-transparent px-4 py-2 rounded-md transition-colors duration-200"
           >
             <Download size={14} />
             Download CV (PDF)
