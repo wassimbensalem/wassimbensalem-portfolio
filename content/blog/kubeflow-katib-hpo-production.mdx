@@ -1,0 +1,370 @@
+---
+title: "Production Katib: Six Hard-Won Lessons for Hyperparameter Optimization in Kubeflow Pipelines"
+date: "2028-03-30"
+readingTime: "14 min read"
+excerpt: "Katib is the right tool for HPO on Kubernetes — but production pipelines expose failure modes that the documentation won't warn you about. Here's what we learned the hard way."
+tags: ["MLOps", "Kubeflow", "Kubernetes", "Hyperparameter Optimization", "Production"]
+---
+
+Every serious ML project hits the same wall: the model architecture is solid, the data is clean, but performance depends heavily on which hyperparameters you chose. Automated hyperparameter optimization (HPO) is the answer — but the tooling choice matters enormously when you're running on Kubernetes with on-premise infrastructure.
+
+Tools like Optuna and Ray Tune are excellent for local experiments or cloud-based workflows. But when your training infrastructure lives inside a Kubernetes cluster — especially in regulated industries where keeping data on-premise matters — you need a solution that speaks Kubernetes natively. That's where **Katib** comes in.
+
+Katib is an open-source, Kubernetes-native HPO and neural architecture search system built as part of the Kubeflow ecosystem. It integrates directly with Kubeflow Pipelines, letting you embed automated hyperparameter search as a first-class step in your ML workflow, right inside your cluster.
+
+We've been running Katib in production at Compredict for automotive AI workloads — complex deep learning models, custom optimization libraries, multi-OEM datasets, on-premise GPU clusters. This article covers what we learned: how Katib actually works, a practical integration example, and six production challenges we ran into and how we solved them.
+
+## How Katib Works
+
+When you create a Katib Experiment — via the Katib API or as a Kubeflow Pipeline step — Katib represents it as a Kubernetes Custom Resource (CRD). That CRD contains everything needed for the search: the objective (minimize val loss, maximize accuracy), the hyperparameter search space, the algorithm (random search, TPE, Bayesian optimization, etc.), and a trial template specifying how to run each training job.
+
+After submission, Katib's Experiment Controller detects the CRD and launches a **Suggestion Pod** running the selected algorithm. The Suggestion Pod proposes candidate hyperparameter sets — with parallelism enabled, it can propose multiple sets simultaneously, letting Katib explore the search space efficiently.
+
+For each suggested set, Katib creates a **Trial**. Each Trial runs as a Kubernetes Job (or as TFJob, PyTorchJob, MPIJob for distributed training). Trials run in complete isolation: if one Trial fails due to bad hyperparameters or a runtime error, it doesn't affect the others.
+
+Katib's Kubernetes-native scheduling is one of its best features. Unlike frameworks that block until all required resources are free, Katib starts Trials incrementally as resources become available. If you configure four parallel GPU Trials but only two GPUs are free, Katib immediately launches two and queues the rest — they start automatically as GPUs are released. This makes Katib genuinely practical on shared clusters.
+
+Once the Experiment reaches its maximum Trial count or a convergence condition, the Experiment Controller aggregates results and returns the best-performing hyperparameter set to the parent pipeline step.
+
+The other big advantage: Katib is **language-agnostic**. Because it works with any containerized training job, you can optimize PyTorch models in Python, gradient boosting in C++, or anything else — all on the same Katib infrastructure, as long as your job outputs metrics in the expected format.
+
+## A Practical Example: Katib Inside a Kubeflow Pipeline
+
+The example below uses **Kubeflow Pipelines v2.13.0** and **Katib v0.15.0**. It's simplified for clarity — our production setup involves more complex model architectures and proprietary packages — but the integration pattern is identical.
+
+```python
+from kfp import dsl
+from kfp.dsl import Dataset, Input, Output
+from typing import Dict
+from kubeflow.katib import KatibClient, models
+
+@dsl.component(
+    base_image="python:3.10-slim",
+    packages_to_install=[
+        "kubeflow-katib==0.15.0",
+        "pandas==2.0.3",
+        "scikit-learn==1.3.0",
+        "numpy==1.24.3",
+        "kubernetes==28.1.0"
+    ]
+)
+def tune_hyperparameters(
+    train_in: Input[Dataset],
+    val_in: Input[Dataset],
+    best_params: Output[Dataset],
+    katib_config: Dict,
+    param_space: Dict,
+    namespace: str = "kubeflow",
+) -> Dict:
+    """Perform hyperparameter tuning using Katib."""
+    import os
+    import json
+    import time
+    import logging
+    from kubeflow.katib import KatibClient, models
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    trial_base_image = os.getenv("BASE_IMAGE", "python:3.10-slim")
+    katib_client = KatibClient()
+    experiment_name = f"hpo-experiment-{int(time.time())}"
+
+    # Build parameter specs from config
+    parameters = []
+    for param_name, param_config in param_space.items():
+        if param_config["type"] == "int":
+            parameters.append(
+                models.V1beta1ParameterSpec(
+                    name=param_name,
+                    parameter_type="int",
+                    feasible_space=models.V1beta1FeasibleSpace(
+                        min=param_config.get("min", "1"),
+                        max=param_config.get("max", "100"),
+                    )
+                )
+            )
+        elif param_config["type"] == "double":
+            parameters.append(
+                models.V1beta1ParameterSpec(
+                    name=param_name,
+                    parameter_type="double",
+                    feasible_space=models.V1beta1FeasibleSpace(
+                        min=param_config.get("min", "0.01"),
+                        max=param_config.get("max", "1.0")
+                    )
+                )
+            )
+        elif param_config["type"] == "categorical":
+            parameters.append(
+                models.V1beta1ParameterSpec(
+                    name=param_name,
+                    parameter_type="categorical",
+                    feasible_space=models.V1beta1FeasibleSpace(
+                        list=param_config.get("values", [])
+                    )
+                )
+            )
+
+    objective = models.V1beta1ObjectiveSpec(
+        type="minimize",
+        objective_metric_name="val_loss",
+        additional_metric_names=[]
+    )
+
+    algorithm = models.V1beta1AlgorithmSpec(
+        algorithm_name=katib_config.get("algorithm", "random")
+    )
+
+    # Trial script — runs inside each trial pod
+    trial_script = """
+import os
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+
+n_estimators = int(os.environ.get("N_ESTIMATORS", 100))
+max_depth = int(os.environ.get("MAX_DEPTH", 10))
+
+train_path = os.environ.get("TRAIN_PATH")
+val_path = os.environ.get("VAL_PATH")
+X_train = pd.read_csv(f"{train_path}/X.csv").values
+y_train = pd.read_csv(f"{train_path}/y.csv").values.ravel()
+X_val = pd.read_csv(f"{val_path}/X.csv").values
+y_val = pd.read_csv(f"{val_path}/y.csv").values.ravel()
+
+model = RandomForestRegressor(
+    n_estimators=n_estimators,
+    max_depth=max_depth,
+    random_state=42
+)
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_val)
+val_loss = mean_squared_error(y_val, y_pred)
+print(f'val_loss={val_loss}')  # Katib parses this from stdout
+"""
+
+    trial_template = models.V1beta1TrialTemplate(
+        primary_container_name="training-container",
+        trial_parameters=[
+            models.V1beta1TrialParameterSpec(
+                name=param.name,
+                reference=param.name
+            ) for param in parameters
+        ],
+        trial_spec={
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "training-container",
+                                "image": trial_base_image,
+                                "command": ["python", "-c", trial_script],
+                                "env": [
+                                    {"name": "TRAIN_PATH", "value": train_in.path},
+                                    {"name": "VAL_PATH", "value": val_in.path}
+                                ] + [
+                                    {
+                                        "name": param.name.upper(),
+                                        "value": f"${{trialParameters.{param.name}}}"
+                                    } for param in parameters
+                                ],
+                                "resources": {
+                                    "requests": {
+                                        "cpu": katib_config.get("cpu_per_trial", "1"),
+                                        "memory": katib_config.get("memory_per_trial", "2Gi")
+                                    }
+                                }
+                            }
+                        ],
+                        "restartPolicy": "Never"
+                    }
+                }
+            }
+        }
+    )
+
+    experiment = models.V1beta1Experiment(
+        api_version="kubeflow.org/v1beta1",
+        kind="Experiment",
+        metadata=models.V1ObjectMeta(
+            name=experiment_name,
+            namespace=namespace
+        ),
+        spec=models.V1beta1ExperimentSpec(
+            max_trial_count=katib_config.get("max_trials", 10),
+            parallel_trial_count=katib_config.get("parallel_trials", 2),
+            algorithm=algorithm,
+            objective=objective,
+            parameters=parameters,
+            trial_template=trial_template,
+            metrics_collector_spec=models.V1beta1MetricsCollectorSpec(
+                collector=models.V1beta1CollectorSpec(kind="StdOut"),
+            ),
+        )
+    )
+
+    logger.info(f"Creating Katib experiment: {experiment_name}")
+    katib_client.create_experiment(experiment, namespace=namespace)
+
+    katib_client.wait_for_experiment_condition(
+        name=experiment_name,
+        namespace=namespace,
+        timeout=katib_config.get("timeout", 36000)
+    )
+
+    optimal_trial = katib_client.get_optimal_hyperparameters(
+        name=experiment_name,
+        namespace=namespace
+    )
+
+    best_hyperparameters = {}
+    if optimal_trial and len(optimal_trial) > 0:
+        for assignment in optimal_trial[0].parameter_assignments:
+            best_hyperparameters[assignment.name] = assignment.value
+
+    os.makedirs(best_params.path, exist_ok=True)
+    with open(f"{best_params.path}/best_params.json", "w") as f:
+        json.dump(best_hyperparameters, f)
+
+    return best_hyperparameters
+```
+
+Four things worth noting in this pattern:
+
+1. **Experiment Definition** — the hyperparameter search space, objective, and algorithm are described using Katib's `V1beta1` API models, which map directly to the CRD spec.
+2. **Trial Template** — specifies the container image, command, and how hyperparameters are injected as environment variables into each trial pod.
+3. **Metric Reporting** — the trial script prints to stdout in the exact format Katib expects: `metric_name=value`. No deviations.
+4. **Result Retrieval** — after the experiment completes, `get_optimal_hyperparameters()` returns the best-performing set for downstream pipeline steps.
+
+This works cleanly for simple models. Production is where things get interesting.
+
+## Six Production Challenges — and How We Solved Them
+
+The following challenges come from running Katib on real ML workloads: complex deep learning models, custom optimization frameworks, on-premise GPU clusters. Some are inherent to Katib's architecture; others emerge from production complexity.
+
+### 1. Data Access in Trial Pods
+
+Trial pods run as isolated Kubernetes Jobs. They cannot directly access artifacts that Kubeflow Pipeline components saved to MinIO — the artifact paths (`/minio/mlpipeline/v2/artifacts/...`) are generated by the pipeline and aren't directly reachable from a separate pod without explicit configuration.
+
+**Our solution:** a hybrid data access strategy combining two approaches.
+
+First, we configure trial pods to access MinIO directly via `boto3`, the same way Kubeflow Pipeline components do. MinIO credentials (endpoint, access key, secret key) are passed as environment variables from Kubernetes secrets. Second, we mount a Persistent Volume Claim (PVC) containing the same data as a fallback — direct filesystem access if network access to MinIO fails.
+
+The trial script tries S3/MinIO first and falls back to the volume mount automatically. We also added path conversion logic to translate Kubeflow artifact paths (which use `/minio/mlpipeline/` prefixes) into paths compatible with both access methods. Redundant, yes — but it eliminates an entire class of data-access failures in production.
+
+### 2. Trial Pod Logging and Debugging
+
+This one is genuinely painful: **trial pod logs are invisible in the Kubeflow Pipeline UI**. When a trial fails, there are no error messages in the pipeline execution view. The experiment just produces no results, and you're left guessing.
+
+The fix requires manual `kubectl` inspection:
+
+```bash
+kubectl logs <trial-pod-name> -n <namespace> -c training-container
+```
+
+Notice the `-c training-container` flag — trial pods can have multiple containers (including sidecar containers), so you must specify which one. The Kubernetes dashboard and a bare `kubectl logs` without the container name won't show the logs you need.
+
+Our practices for making this workable:
+- Extensive logging at every critical stage in the trial script: data loading, hyperparameter parsing, model initialization, training, and evaluation.
+- In development, we add a 5-minute `sleep` at the end of trial execution to keep pods alive long enough for inspection.
+- Minimal debug versions of the trial script that test each stage independently, letting us isolate exactly where failures occur.
+
+<Callout type="warning">
+Silent failures are Katib's biggest usability gap. Establish a `kubectl logs` workflow before you need it — don't wait until an experiment produces zero results in production.
+</Callout>
+
+### 3. Hyperparameter Mapping
+
+Katib requires every hyperparameter in your search space to be explicitly mapped in three separate places:
+
+1. **Parameter spec** — defines the type and search range via `V1beta1ParameterSpec`
+2. **Trial parameters list** — declares which parameters to pass to trials via `V1beta1TrialParameterSpec`
+3. **Environment variables** — makes them available inside the trial container using the `${trialParameters.param_name}` template syntax
+
+If a parameter is missing from any of these three places, trial pods fail silently — they start, but never receive the required values. The environment variable name must be the uppercase version of the parameter name (`learning_rate` → `LEARNING_RATE`), and the trial script must convert them to the right types (everything arrives as a string).
+
+This triple-mapping requirement is verbose and error-prone. We solved it by generating all three mappings in a single loop over the parameter config dictionary, which ensures they stay in sync as the search space evolves.
+
+### 4. Metric Collection and Parsing
+
+Katib's StdOut metrics collector has strict requirements. It reads from the training container's stdout and expects exactly: `metric_name=value` on a single line — no extra whitespace, no different separators, and critically, not on stderr.
+
+A few rules we learned:
+
+- Use Python's `print()` to stdout explicitly: `print(f'val_loss={val_loss}')`
+- Flush both buffers immediately after: `sys.stdout.flush(); sys.stderr.flush()`
+- Add a short `sleep(5)` after printing — the metrics collector sidecar needs time to capture the output before the container exits
+- The metric name in the print statement **must exactly match** `objective_metric_name` in the experiment spec — `val_loss` and `validation_loss` are not the same thing
+
+If you need to debug the collector itself:
+
+```bash
+kubectl logs <trial-pod-name> -n <namespace> -c metrics-collector-sidecar
+```
+
+### 5. Experiment Timeout and Resource Stalls
+
+Without explicit timeout configuration, a Katib experiment can hang indefinitely. Trial pods that are stuck in `Pending` due to insufficient cluster resources will wait forever — and so will your pipeline.
+
+We handle this at multiple levels:
+- Set a realistic `timeout` parameter in `wait_for_experiment_condition()`. For our workloads, 10 hours (36000 seconds) is the baseline.
+- Implement a manual polling fallback that checks `experiment.status.conditions` every 10 seconds, detecting terminal states (Succeeded or Failed) independently of Katib's client methods.
+- Monitor for trials stuck in `Pending` state. If trials aren't scheduling, the cluster almost certainly doesn't have enough GPU or memory resources. The fix is either reducing `parallel_trial_count` or scaling the cluster — not increasing the timeout.
+
+The `parallel_trial_count` setting is the most important lever for shared clusters. Set it too high and you'll have trials stuck pending indefinitely; set it too low and you leave utilization on the table.
+
+### 6. Complex Optimization Functions and Docker Containerization
+
+The simplified example above works well for scikit-learn models. Real production workloads — deep learning models, custom optimization frameworks, GPU-dependent libraries, proprietary packages — do not.
+
+When your trial code has complex dependencies, Katib trial pods will fail silently. They start, then terminate without metrics or useful errors. The root cause: a minimal base image (like `python:3.10-slim`) attempting to install complex packages at runtime, failing because those packages require system-level dependencies, CUDA libraries, or specific compilation environments.
+
+**The solution: build a dedicated Docker image.** Don't rely on runtime package installation for anything beyond trivial dependencies.
+
+Our trial Docker image is based on `tensorflow/tensorflow:2.17.0-gpu` and includes:
+- All Python dependencies pre-installed from a requirements file
+- The trial helper script already copied into the container (`/app/training_package/katib_objective_helper.py`)
+- System-level dependencies (CUDA, cuDNN)
+- The complete training package, compiled and ready
+
+The trial template references this pre-built image, and the trial command simply executes the pre-installed script:
+
+```python
+"command": ["python3", "/app/training_package/katib_objective_helper.py"]
+```
+
+This eliminates an entire category of failures. The key insight: for anything beyond toy models, **invest in a proper Docker image before debugging Katib**. Every hour spent chasing silent trial failures is an hour you could have spent building the image instead.
+
+<Callout type="tip">
+Tag your trial images with both a `latest` pointer and a versioned tag (`v1.2.3`). Katib trial pods pull the image every run — a broken `latest` will silently fail all your trials.
+</Callout>
+
+## When Is Katib Worth It?
+
+Katib makes the most sense if you check most of these boxes:
+
+- **You're already on Kubernetes** and want HPO to fit natively into that infrastructure
+- **You use Kubeflow Pipelines** and want optimization as a first-class pipeline step
+- **You work across languages** — your teams use Python, C++, R, or other runtimes that need to share infrastructure
+- **You need resource-aware scheduling** on shared GPU clusters
+
+If you're doing local development, working exclusively in Python, or need a fast setup for experimentation, Optuna or Ray Tune will get you there faster. But if you're committed to Kubernetes-native ML infrastructure, Katib gives you something those tools don't: HPO that is part of the cluster, not bolted onto it.
+
+## Key Takeaways
+
+The six challenges above are solvable — and once you've solved them, Katib is genuinely powerful. Here's the condensed version:
+
+1. **Start simple.** Validate the setup with a small experiment and a simple model before scaling to production workloads.
+2. **Build Docker images early.** For any non-trivial training code, a dedicated trial image eliminates the largest category of failures.
+3. **Set up your debugging workflow before you need it.** `kubectl logs -c training-container` is the command you'll use repeatedly — know it before your first production failure.
+4. **Be explicit about everything.** Hyperparameter mappings, metric names, timeout values — Katib rewards explicit configuration and silently punishes omissions.
+5. **Right-size your parallelism.** Match `parallel_trial_count` to your cluster's actual available resources, not its theoretical capacity.
+6. **Treat hybrid data access as infrastructure.** S3 + PVC fallback is not over-engineering — it's the difference between an HPO step that occasionally fails and one that doesn't.
+
+The investment required to run Katib in production is real. But the result — automated, scalable hyperparameter optimization that integrates natively into your ML pipelines — is worth it for any team operating ML at scale on Kubernetes.

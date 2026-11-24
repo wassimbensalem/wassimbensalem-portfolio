@@ -21,13 +21,21 @@ const EXPERIENCE: ExperienceEntry[] = [
     metric: '70% faster dev cycles · 63% cloud cost reduction',
   },
   {
-    title: 'MSc Computer Science, Honors',
+    title: 'MSc Computer Science — with Distinction',
     org: 'Technical University of Darmstadt',
     period: 'GPA 1.2 · Thesis 1.0',
     location: 'Darmstadt, Germany',
     highlight:
       'Thesis: Generative compression of time-series models using WGANs, Knowledge Distillation, and Neural Architecture Search for automotive edge deployment.',
     metric: '91% model size reduction · state-of-the-art benchmarks',
+  },
+  {
+    title: 'McKinsey Forward Program',
+    org: 'McKinsey & Company',
+    period: '2023',
+    location: 'Certificate',
+    highlight:
+      'Selective leadership and capability-building program. Focus on structured problem solving, data-driven decision making, and effective communication in complex organizations.',
   },
   {
     title: 'Earlier experience',
